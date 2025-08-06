@@ -1,4 +1,16 @@
 # app.R
+# -------------------------------------------------------------------
+# Canvassing Analytics Dashboard  (v0.0.0.3)
+#
+# REMINDER (for developers only; not displayed in the UI):
+# 1) Location → pick ED type & EDs; optionally pick OAs (default: all in EDs).
+# 2) Click "Load location data" to fetch rows for selected OAs (mandatory step).
+# 3) Time filters: optional date range; weekday & time of day (multi, default all).
+# 4) Factors: Q1/Q2/Q3/Q4 populated from the loaded location subset.
+# 5) SQL is built incrementally and shown before execution.
+# 6) Click "Retrieve data" to run final query and show results.
+# -------------------------------------------------------------------
+
 library(shiny)
 library(shinyWidgets)
 library(shinyjs)
@@ -7,23 +19,11 @@ library(pool)
 library(RMariaDB)
 library(glue)
 library(dplyr)
+library(DT)
 
-# -----------------------------
-# Version & reminder (edit version when you change code)
-# -----------------------------
-APP_VERSION <- "0.0.0.1"
-REMINDER_LINES <- c(
-  "Location → pick ED type & EDs; optionally pick OAs (default: all in EDs).",
-  "Click **Load location data** to fetch rows for selected OAs (mandatory).",
-  "Time filters: optional date range; weekday & time of day (multi, default all).",
-  "Factors: Q1/Q2/Q3/Q4 populated from the loaded location subset.",
-  "SQL is built incrementally and shown before execution.",
-  "Click **Retrieve data** to run the final query and show the results."
-)
+APP_VERSION <- "0.0.0.4"
 
-# -----------------------------
-# Connection pool
-# -----------------------------
+# ----- DB pool -----
 pool <- dbPool(
   drv      = RMariaDB::MariaDB(),
   dbname   = Sys.getenv("MYSQL_DATABASE", "canvass_simulation"),
@@ -35,9 +35,7 @@ pool <- dbPool(
 )
 onStop(function() poolClose(pool))
 
-# -----------------------------
-# ED type -> column mapping (UPDATED)
-# -----------------------------
+# ----- ED mapping (UPDATED) -----
 ed_map <- list(
   "Parliamentary constituency" = list(code = "pcon25cd",  name = "pcon25nm"),
   "Local Authority"            = list(code = "lad24cd",   name = "lad24nm"),
@@ -46,38 +44,35 @@ ed_map <- list(
   "Senedd"                     = list(code = "sened26cd", name = "sened26nm")
 )
 
+# helpers
 is_all <- function(x) is.null(x) || length(x) == 0 || any(x == "*")
 parse_ed_codes <- function(x) if (is.null(x) || length(x) == 0) character(0) else unique(sub("\\|.*$", "", x))
 
-# -----------------------------
-# UI
-# -----------------------------
+# ----- UI -----
 ui <- fluidPage(
   useShinyjs(),
   tags$head(
     tags$style(HTML("
       .header-row { display:flex; align-items:flex-start; justify-content:space-between; }
-      .version-info { font-style:italic; font-size: 0.9em; text-align:right; max-width: 50%; }
-      .version-info .ver { opacity: 0.8; }
-      .version-info ul { margin: 0.25rem 0 0 1.1rem; padding:0; }
+      .version-info { font-style:italic; font-size: 0.9em; text-align:right; opacity: 0.8; }
     "))
   ),
-  # Custom header with right-aligned version + reminder
   fluidRow(
     column(
-      width = 12,
+      12,
       div(class="header-row",
           h2("Canvassing Analytics Dashboard"),
-          div(class="version-info",
-              span(class="ver", sprintf("v%s", APP_VERSION)),
-              tags$ul(lapply(REMINDER_LINES, function(x) tags$li(x)))
-          )
+          div(class="version-info", sprintf("v%s", APP_VERSION))
       )
     )
   ),
   sidebarLayout(
     sidebarPanel(
+      # NEW: training toggle
+      checkboxInput("use_training", "Use training table only (responses_t) and select by OA only", value = FALSE),
+      hr(),
       h4("1) Location"),
+      # ED controls (disabled when training toggle is on)
       selectInput("ed_type", "Electoral Division type",
                   choices = names(ed_map), selected = "Parliamentary constituency"),
       pickerInput("ed_names", "Electoral Division(s)",
@@ -89,6 +84,7 @@ ui <- fluidPage(
       actionButton("load_location", "Load location data", class="btn-info"),
       tags$small(em("You must load location data before running the final query.")),
       hr(),
+      
       h4("2) Time"),
       tabsetPanel(
         tabPanel("Date range",
@@ -123,24 +119,55 @@ ui <- fluidPage(
       h4("Results"),
       verbatimTextOutput("sql_preview"),
       tableOutput("summary"),
-      dataTableOutput("rows")
+      DTOutput("rows")
     )
   )
 )
 
-# -----------------------------
-# Server
-# -----------------------------
+# ----- Server -----
 server <- function(input, output, session) {
   
-  shinyjs::disable("run_query")     # Final button disabled until location data is loaded
-  location_data <- reactiveVal(NULL) # Holds rows loaded by the new Location action
-  location_scope_sql <- reactiveVal(NULL) # Holds the WHERE (oa21cd IN ...) used to load location
+  shinyjs::disable("run_query")
+  location_data <- reactiveVal(NULL)
+  location_scope_sql <- reactiveVal(NULL)
+  
+  base_table <- reactive({
+    if (isTRUE(input$use_training)) "canvass_simulation.responses_t" else "canvass_simulation.responses"
+  })
   
   ed_cols <- reactive({ ed_map[[input$ed_type]] })
   
-  # Populate ED names by type
+  # Toggle behavior: when training mode is ON, disable ED controls and load OA list from responses_t
+  observeEvent(input$use_training, {
+    if (isTRUE(input$use_training)) {
+      shinyjs::disable("ed_type"); shinyjs::disable("ed_names")
+      # OA list from responses_t
+      sql <- glue("SELECT DISTINCT oa21cd FROM {base_table()} WHERE oa21cd IS NOT NULL ORDER BY oa21cd")
+      oa_df <- dbGetQuery(pool, sql)
+      updatePickerInput(session, "oa_codes",
+                        choices = c("*"="*", setNames(oa_df$oa21cd, oa_df$oa21cd)),
+                        selected="*")
+    } else {
+      shinyjs::enable("ed_type"); shinyjs::enable("ed_names")
+      updatePickerInput(session, "oa_codes", choices = c("*"="*"), selected="*")
+      # repopulate EDs for current type
+      cols <- ed_cols()
+      sql <- glue_sql("
+        SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
+        FROM ed_complete_20250720
+        WHERE {`cols$name`} IS NOT NULL AND {`cols$code`} IS NOT NULL
+        ORDER BY {`cols$name`}
+      ", .con = pool)
+      df <- dbGetQuery(pool, sql)
+      choices <- setNames(paste(df$ed_code, df$ed_name, sep="|"), df$ed_name)
+      updatePickerInput(session, "ed_names", choices = choices, selected = NULL)
+    }
+    location_data(NULL); location_scope_sql(NULL); shinyjs::disable("run_query")
+  }, ignoreInit = TRUE)
+  
+  # Populate ED names when not in training mode
   observeEvent(input$ed_type, {
+    req(!isTRUE(input$use_training))
     cols <- ed_cols(); validate(need(!is.null(cols), "Unknown ED type"))
     sql <- glue_sql("
       SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
@@ -152,13 +179,12 @@ server <- function(input, output, session) {
     choices <- setNames(paste(df$ed_code, df$ed_name, sep="|"), df$ed_name)
     updatePickerInput(session, "ed_names", choices = choices, selected = NULL)
     updatePickerInput(session, "oa_codes", choices = c("*"="*"), selected="*")
-    location_data(NULL)
-    location_scope_sql(NULL)
-    shinyjs::disable("run_query")
+    location_data(NULL); location_scope_sql(NULL); shinyjs::disable("run_query")
   }, ignoreInit = TRUE)
   
-  # OA options after ED pick
+  # OA list when EDs change (normal mode)
   observeEvent(input$ed_names, {
+    req(!isTRUE(input$use_training))
     cols <- ed_cols()
     ed_codes <- parse_ed_codes(input$ed_names)
     if (!length(ed_codes)) {
@@ -177,42 +203,44 @@ server <- function(input, output, session) {
                       selected="*")
   }, ignoreInit = TRUE)
   
-  # -------- New: Load location data (mandatory step) --------
+  # Mandatory: load location data
   observeEvent(input$load_location, {
-    cols <- ed_cols()
-    ed_codes <- parse_ed_codes(input$ed_names)
-    
-    # Subquery for OAs inside chosen EDs (if EDs provided)
     clauses <- list()
-    if (length(ed_codes)) {
-      oa_in_eds <- glue_sql("
-        SELECT DISTINCT oa21cd
-        FROM ed_complete_20250720
-        WHERE {`cols$code`} IN ({ed_codes*})
-      ", .con = pool)
-      clauses <- append(clauses, glue("oa21cd IN ({oa_in_eds})"))
+    
+    if (isTRUE(input$use_training)) {
+      # Training mode: OA-only from responses_t
+      if (!is_all(input$oa_codes)) {
+        clauses <- append(clauses, glue_sql("oa21cd IN ({input$oa_codes*})", .con = pool))
+      }
+    } else {
+      # Normal mode: OAs from EDs, optionally narrowed by explicit OAs
+      cols <- ed_cols()
+      ed_codes <- parse_ed_codes(input$ed_names)
+      if (length(ed_codes)) {
+        oa_in_eds <- glue_sql("
+          SELECT DISTINCT oa21cd
+          FROM ed_complete_20250720
+          WHERE {`cols$code`} IN ({ed_codes*})
+        ", .con = pool)
+        clauses <- append(clauses, glue("oa21cd IN ({oa_in_eds})"))
+      }
+      if (!is_all(input$oa_codes)) {
+        clauses <- append(clauses, glue_sql("oa21cd IN ({input$oa_codes*})", .con = pool))
+      }
     }
     
-    # If user picked explicit OAs (not "*"), narrow further
-    if (!is_all(input$oa_codes)) {
-      clauses <- append(clauses, glue_sql("oa21cd IN ({input$oa_codes*})", .con = pool))
-    }
-    
-    # If neither EDs nor explicit OAs given, we won't filter by OA (== full table).
     where_sql <- if (length(clauses)) paste("WHERE", paste(clauses, collapse = " AND ")) else ""
-    
-    # Save scope where for re-use in final SQL
     location_scope_sql(where_sql)
     
     sql <- glue("
       SELECT *
-      FROM canvass_simulation.responses
+      FROM {base_table()}
       {where_sql}
     ")
     df <- dbGetQuery(pool, sql)
     location_data(df)
     
-    # Populate dropdowns (weekday & factors) from the loaded location data
+    # Update dependent dropdowns from loaded data
     wk <- sort(unique(na.omit(df$weekday)))
     updatePickerInput(session, "weekday", choices = c("*"="*", wk), selected="*")
     
@@ -226,42 +254,35 @@ server <- function(input, output, session) {
     set_choices("Q4_Issue", "q4")
     
     shinyjs::enable("run_query")
-    showNotification(sprintf("Loaded %,d rows for current location scope.", nrow(df)),
-                     type = "message", duration = 5)
+    showNotification(
+      sprintf("Loaded %s rows from %s.", format(nrow(df), big.mark = ","), base_table()),
+      type = "message", duration = 5
+    )
   })
   
-  # ---------------- Final SQL (uses location scope + time + factors) ----------------
+  # Final SQL (uses base_table + saved location scope + time + factors)
   final_sql <- eventReactive(input$run_query, {
     validate(need(!is.null(location_data()), "Load location data first."))
     clauses <- list()
-    
-    # Start with the OA scope captured by the Location action
     loc_where <- location_scope_sql()
-    if (nzchar(loc_where)) {
-      # We will rebuild WHERE; strip leading 'WHERE ' for reuse
-      loc_core <- sub("^WHERE\\s+", "", loc_where)
-      clauses <- append(clauses, loc_core)
+    if (!is.null(loc_where) && nzchar(loc_where)) {
+      clauses <- append(clauses, sub("^WHERE\\s+", "", loc_where))
     }
-    
-    # Time filters
     if (!is.null(input$start_date)) clauses <- append(clauses, glue_sql("survey_date >= {input$start_date}", .con = pool))
     if (!is.null(input$end_date))   clauses <- append(clauses, glue_sql("survey_date <= {input$end_date}",   .con = pool))
     if (!is_all(input$weekday))     clauses <- append(clauses, glue_sql("weekday IN ({input$weekday*})", .con = pool))
     if (!is_all(input$tod))         clauses <- append(clauses, glue_sql("timeOfDay IN ({input$tod*})",   .con = pool))
-    
-    # Factors
     if (!is_all(input$q1)) clauses <- append(clauses, glue_sql("Q1_Party IN ({input$q1*})", .con = pool))
     if (!is_all(input$q2)) clauses <- append(clauses, glue_sql("Q2_Support IN ({input$q2*})", .con = pool))
     if (!is_all(input$q3)) clauses <- append(clauses, glue_sql("Q3_Votelikelihood IN ({input$q3*})", .con = pool))
     if (!is_all(input$q4)) clauses <- append(clauses, glue_sql("Q4_Issue IN ({input$q4*})", .con = pool))
     
     where_sql <- if (length(clauses)) paste("WHERE", paste(clauses, collapse = " AND ")) else ""
-    
     glue("
       SELECT
         oa21cd, survey_date, weekday, timeOfDay,
         Q1_Party, Q2_Support, Q3_Votelikelihood, Q4_Issue
-      FROM canvass_simulation.responses
+      FROM {base_table()}
       {where_sql}
     ")
   })
@@ -272,7 +293,9 @@ server <- function(input, output, session) {
     dbGetQuery(pool, final_sql())
   })
   
-  output$rows <- renderDataTable({ req(results()) })
+  output$rows <- DT::renderDT({
+    req(results())
+  }, options = list(pageLength = 25), filter = "top")
   
   output$summary <- renderTable({
     df <- results(); req(nrow(df) > 0)
