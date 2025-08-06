@@ -1,6 +1,6 @@
 # app.R
 # -------------------------------------------------------------------
-# Canvassing Analytics Dashboard  (v0.0.0.3)
+# Canvassing Analytics Dashboard  (v0.0.0.4)
 #
 # REMINDER (for developers only; not displayed in the UI):
 # 1) Location → pick ED type & EDs; optionally pick OAs (default: all in EDs).
@@ -74,7 +74,7 @@ ui <- fluidPage(
       h4("1) Location"),
       # ED controls (disabled when training toggle is on)
       selectInput("ed_type", "Electoral Division type",
-                  choices = names(ed_map), selected = "Parliamentary constituency"),
+                  choices = c("*", names(ed_map)), selected = "*"),
       pickerInput("ed_names", "Electoral Division(s)",
                   choices = NULL, multiple = TRUE,
                   options = list(`actions-box` = TRUE, `live-search` = TRUE)),
@@ -150,17 +150,19 @@ server <- function(input, output, session) {
     } else {
       shinyjs::enable("ed_type"); shinyjs::enable("ed_names")
       updatePickerInput(session, "oa_codes", choices = c("*"="*"), selected="*")
-      # repopulate EDs for current type
-      cols <- ed_cols()
-      sql <- glue_sql("
-        SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
-        FROM ed_complete_20250720
-        WHERE {`cols$name`} IS NOT NULL AND {`cols$code`} IS NOT NULL
-        ORDER BY {`cols$name`}
-      ", .con = pool)
-      df <- dbGetQuery(pool, sql)
-      choices <- setNames(paste(df$ed_code, df$ed_name, sep="|"), df$ed_name)
-      updatePickerInput(session, "ed_names", choices = choices, selected = NULL)
+      # repopulate EDs for current type if not "*"
+      if (input$ed_type != "*") {
+        cols <- ed_cols()
+        sql <- glue_sql("
+          SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
+          FROM ed_complete_20250720
+          WHERE {`cols$name`} IS NOT NULL AND {`cols$code`} IS NOT NULL
+          ORDER BY {`cols$name`}
+        ", .con = pool)
+        df <- dbGetQuery(pool, sql)
+        choices <- setNames(paste(df$ed_code, df$ed_name, sep="|"), df$ed_name)
+        updatePickerInput(session, "ed_names", choices = choices, selected = NULL)
+      }
     }
     location_data(NULL); location_scope_sql(NULL); shinyjs::disable("run_query")
   }, ignoreInit = TRUE)
@@ -168,6 +170,10 @@ server <- function(input, output, session) {
   # Populate ED names when not in training mode
   observeEvent(input$ed_type, {
     req(!isTRUE(input$use_training))
+    if (input$ed_type == "*") {
+      updatePickerInput(session, "ed_names", choices = c("*"="*"), selected = "*")
+      return()
+    }
     cols <- ed_cols(); validate(need(!is.null(cols), "Unknown ED type"))
     sql <- glue_sql("
       SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
@@ -185,6 +191,10 @@ server <- function(input, output, session) {
   # OA list when EDs change (normal mode)
   observeEvent(input$ed_names, {
     req(!isTRUE(input$use_training))
+    if (is_all(input$ed_names) || input$ed_type == "*") {
+      updatePickerInput(session, "oa_codes", choices = c("*"="*"), selected="*")
+      return()
+    }
     cols <- ed_cols()
     ed_codes <- parse_ed_codes(input$ed_names)
     if (!length(ed_codes)) {
@@ -214,15 +224,17 @@ server <- function(input, output, session) {
       }
     } else {
       # Normal mode: OAs from EDs, optionally narrowed by explicit OAs
-      cols <- ed_cols()
-      ed_codes <- parse_ed_codes(input$ed_names)
-      if (length(ed_codes)) {
-        oa_in_eds <- glue_sql("
-          SELECT DISTINCT oa21cd
-          FROM ed_complete_20250720
-          WHERE {`cols$code`} IN ({ed_codes*})
-        ", .con = pool)
-        clauses <- append(clauses, glue("oa21cd IN ({oa_in_eds})"))
+      if (input$ed_type != "*" && !is_all(input$ed_names)) {
+        cols <- ed_cols()
+        ed_codes <- parse_ed_codes(input$ed_names)
+        if (length(ed_codes)) {
+          oa_in_eds <- glue_sql("
+            SELECT DISTINCT oa21cd
+            FROM ed_complete_20250720
+            WHERE {`cols$code`} IN ({ed_codes*})
+          ", .con = pool)
+          clauses <- append(clauses, glue("oa21cd IN ({oa_in_eds})"))
+        }
       }
       if (!is_all(input$oa_codes)) {
         clauses <- append(clauses, glue_sql("oa21cd IN ({input$oa_codes*})", .con = pool))
@@ -239,6 +251,14 @@ server <- function(input, output, session) {
     ")
     df <- dbGetQuery(pool, sql)
     location_data(df)
+    
+    # Auto-update date inputs
+    if ("survey_date" %in% names(df) && nrow(df) > 0) {
+      min_date <- suppressWarnings(min(df$survey_date, na.rm = TRUE))
+      max_date <- suppressWarnings(max(df$survey_date, na.rm = TRUE))
+      updateDateInput(session, "start_date", value = min_date)
+      updateDateInput(session, "end_date", value = max_date)
+    }
     
     # Update dependent dropdowns from loaded data
     wk <- sort(unique(na.omit(df$weekday)))
