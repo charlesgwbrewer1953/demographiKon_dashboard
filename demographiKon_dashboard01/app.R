@@ -120,11 +120,11 @@ ui <- fluidPage(
       pickerInput("analysis_party", "Party focus (Q1_Party)",
                   choices = c("(load data first)"=""), multiple = FALSE),
       pickerInput("analysis_support_levels", "Supportive Q2 levels",
-                  choices = c("Very likely", "Likely", "Lean", "Unsure", "Unlikely", "Very unlikely"),
-                  selected = c("Very likely","Likely","Lean"), multiple = TRUE,
+                  choices = c("pledge", "strong", "lean_to", "none"),
+                  selected = c("pledge", "strong"), multiple = TRUE,
                   options = list(`actions-box`=TRUE)),
       pickerInput("analysis_persuadable_levels", "Persuasion levels (Q2)",
-                  choices = c("Unsure","Lean"), selected = c("Unsure","Lean"),
+                  choices = c("lean_to"), selected = c("lean_to"),
                   multiple = TRUE, options = list(`actions-box`=TRUE)),
       selectInput("analysis_metric", "Metric",
                   choices = c("Support rate (EB)"="rate_eb",
@@ -368,7 +368,7 @@ server <- function(input, output, session) {
         pers    = ifelse(Q2_Support %in% input$analysis_persuadable_levels, 1, 0)
       )
     ##################
-    browser()
+
     df <- df %>%
       mutate(
         success = ifelse(Q1_Party == input$analysis_party &
