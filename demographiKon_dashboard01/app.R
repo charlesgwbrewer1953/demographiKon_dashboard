@@ -157,6 +157,7 @@ ui <- fluidPage(
       plotOutput("plot_top_oas", height = 320),
       plotOutput("plot_heatmap", height = 320),
       plotOutput("plot_response_heatmap", height = 320),
+      plotOutput("plot_heatmap", height = 320),
       tabPanel("Debug",
                verbatimTextOutput("dbg_counts"),
                verbatimTextOutput("dbg_cols"),
@@ -576,37 +577,61 @@ server <- function(input, output, session) {
     df <- analysis_df()
     req(nrow(df) > 0, input$analysis_party != "")
     
-    time_col <- dplyr::case_when(
-      "timeofDay"   %in% names(df) ~ "timeofDay",
-      "timeofday"   %in% names(df) ~ "timeofday",
-      "time_period" %in% names(df) ~ "time_period",
-      "timeOfDay"   %in% names(df) ~ "timeOfDay",
-      TRUE ~ NA_character_
-    )
-    req(!is.na(time_col))
-    req("weekday" %in% names(df))
+    # Ensure weekdays in the right order
+    weekday_levels <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
     
+    # Mark "success" based on Q1/Q2
     df2 <- df %>%
-      mutate(success = ifelse(Q1_Party == input$analysis_party & Q2_Support %in% input$analysis_support_levels, 1, 0)) %>%
-      filter(!is.na(weekday), !is.na(.data[[time_col]])) %>%
-      group_by(weekday, .data[[time_col]]) %>%
+      mutate(
+        responded = ifelse(!is.na(Q1_Party) & !is.na(Q2_Support), 1, 0),
+        success = ifelse(
+          responded == 1 &
+            Q1_Party == input$analysis_party &
+            Q2_Support %in% input$analysis_support_levels,
+          1, 0
+        )
+      ) %>%
+      filter(!is.na(weekday), !is.na(timeofDay)) %>%
+      mutate(
+        weekday = factor(weekday, levels = weekday_levels),
+        timeofDay = factor(timeofDay, levels = c("morning", "afternoon", "evening"))
+      ) %>%
+      group_by(weekday, timeofDay) %>%
       summarise(
-        n_eff = sum(._w, na.rm = TRUE),
+        total_ops = n(),
+        n_responses = sum(responded, na.rm = TRUE),
         s_eff = sum(._w * success, na.rm = TRUE),
+        n_eff = sum(._w * responded, na.rm = TRUE),
         .groups = "drop"
       ) %>%
-      filter(n_eff > 0)
+      filter(total_ops > 0)
     
     if (nrow(df2) == 0) return(NULL)
     
+    # Bayesian prior
     prior <- compute_eb_prior(df2$s_eff, df2$n_eff)
-    df2 <- df2 %>%
-      mutate(rate_eb = (s_eff + prior$alpha0) / (n_eff + prior$alpha0 + prior$beta0))
     
-    ggplot(df2, aes(x = .data[[time_col]], y = weekday, fill = rate_eb)) +
-      geom_tile() +
-      scale_fill_continuous(name = "Support rate (EB)", limits = c(0, 1)) +
-      labs(x = "Time of day", y = "Weekday", title = "Best times to canvass (selected party)") +
+    df2 <- df2 %>%
+      mutate(
+        rate_eb = (s_eff + prior$alpha0) / (n_eff + prior$alpha0 + prior$beta0),
+        response_rate = n_responses / total_ops
+      )
+    
+    ggplot(df2, aes(x = timeofDay, y = weekday, fill = rate_eb)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(
+        low = "red", mid = "white", high = "blue",
+        midpoint = 0.5, limits = c(0, 1),
+        name = "Support rate (EB)"
+      ) +
+      geom_text(aes(label = sprintf("%.0f%%\nResp: %.0f%%", rate_eb * 100, response_rate * 100)),
+                size = 3) +
+      labs(
+        x = "Time of day",
+        y = "Weekday",
+        title = "Best times to canvass (selected party)",
+        subtitle = "Values show EB support rate and overall response rate"
+      ) +
       theme_minimal()
   })
   
@@ -615,8 +640,10 @@ server <- function(input, output, session) {
     df <- analysis_df()
     req(nrow(df) > 0)
     
+    # Need Response column to compute response rate
     if (!("Response" %in% names(df))) return(NULL)
     
+    # Detect time-of-day column
     time_col <- dplyr::case_when(
       "timeofDay"   %in% names(df) ~ "timeofDay",
       "timeofday"   %in% names(df) ~ "timeofday",
@@ -627,29 +654,49 @@ server <- function(input, output, session) {
     req(!is.na(time_col))
     req("weekday" %in% names(df))
     
-    # Coerce Response to 0/1
+    # Coerce Response to 0/1 robustly
     if (!is.numeric(df$Response)) {
-      df <- df %>%
-        mutate(Response = ifelse(tolower(as.character(Response)) %in% c("1","yes","y","responded","true","t"), 1, 0))
+      df$Response <- ifelse(
+        tolower(as.character(df$Response)) %in% c("1","y","yes","true","t","responded"),
+        1, 0
+      )
     }
     
-    df2 <- df %>%
-      filter(!is.na(weekday), !is.na(.data[[time_col]])) %>%
-      group_by(weekday, .data[[time_col]] ) %>%
-      summarise(
-        n_total = n(),
-        n_response = sum(Response, na.rm = TRUE),
-        rate_response = ifelse(n_total > 0, n_response / n_total, NA_real_),
+    # Order axes
+    wk_levels <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+    df$weekday <- factor(as.character(df$weekday), levels = wk_levels, ordered = TRUE)
+    if (all(unique(na.omit(df[[time_col]])) %in% c("morning","afternoon","evening"))) {
+      df[[time_col]] <- factor(df[[time_col]],
+                               levels = c("morning","afternoon","evening"),
+                               ordered = TRUE)
+    }
+    
+    # Aggregate to weekday x time with per-attempt denominators (weighted by recency)
+    agg <- df %>%
+      dplyr::filter(!is.na(weekday), !is.na(.data[[time_col]])) %>%
+      dplyr::group_by(weekday, .data[[time_col]]) %>%
+      dplyr::summarise(
+        n_attempts = sum(._w, na.rm = TRUE),             # all attempts (response or not)
+        n_resp     = sum(._w * Response, na.rm = TRUE),  # responded
+        resp_rate  = dplyr::if_else(n_attempts > 0, n_resp / n_attempts, NA_real_),
         .groups = "drop"
       ) %>%
-      filter(n_total > 0, !is.na(rate_response))
+      dplyr::filter(!is.na(resp_rate))
     
-    if (nrow(df2) == 0) return(NULL)
+    if (!nrow(agg)) return(NULL)
     
-    ggplot(df2, aes(x = .data[[time_col]], y = weekday, fill = rate_response)) +
-      geom_tile() +
-      scale_fill_continuous(name = "Response rate", limits = c(0, 1)) +
-      labs(x = "Time of day", y = "Weekday", title = "Response rate by time period") +
+    ggplot(agg, aes(x = .data[[time_col]], y = weekday, fill = resp_rate)) +
+      geom_tile(color = "white") +
+      scale_fill_gradientn(
+        colours = c("#b2182b", "#ef8a62", "#fddbc7", "#f7f7f7", "#d1e5f0", "#67a9cf", "#2166ac"),
+        limits = c(0, 1), name = "Response rate"
+      ) +
+      geom_text(aes(label = sprintf("%.0f%%", resp_rate * 100)), size = 3) +
+      labs(
+        x = "Time of day",
+        y = "Weekday",
+        title = "Response rate by weekday × time period"
+      ) +
       theme_minimal()
   })
 }
