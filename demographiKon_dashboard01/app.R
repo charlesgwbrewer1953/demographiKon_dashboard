@@ -1,6 +1,6 @@
 # app.R
 # -------------------------------------------------------------------
-# Canvassing Analytics Dashboard  (v0.0.0.7)
+# Canvassing Analytics Dashboard  (v0.0.0.9)
 #
 # REMINDER (for developers only; not displayed in the UI):
 # 1) Location → pick ED type & EDs; optionally pick OAs (default: all in EDs).
@@ -22,8 +22,9 @@ library(dplyr)
 library(DT)
 library(ggplot2)
 library(lubridate)
+library(rlang)
 
-APP_VERSION <- "0.0.0.7"
+APP_VERSION <- "0.0.0.9"
 
 # ----- DB pool -----
 pool <- dbPool(
@@ -70,7 +71,7 @@ ui <- fluidPage(
   ),
   sidebarLayout(
     sidebarPanel(
-      checkboxInput("use_training", "Use training table only (responses_t) and select by OA only", value = FALSE),
+      checkboxInput("use_training", "Use training table only (responses_q) and select by OA only", value = FALSE),
       hr(),
       h4("1) Location"),
       selectInput("ed_type", "Electoral Division type",
@@ -106,11 +107,18 @@ ui <- fluidPage(
       h4("3) Factors"),
       pickerInput("q1", "Q1_Party", choices = c("*"="*"), multiple = TRUE, selected="*",
                   options = list(`actions-box`=TRUE, `live-search`=TRUE)),
-      pickerInput("q2", "Q2_Support", choices = c("*"="*"), multiple = TRUE, selected="*",
+      # Standardized values for Q2, Q3, Q4
+      pickerInput("q2", "Q2_Support",
+                  choices = c("*"="*", "pledge", "strong", "lean_to", "none"),
+                  selected = "*", multiple = TRUE,
                   options = list(`actions-box`=TRUE, `live-search`=TRUE)),
-      pickerInput("q3", "Q3_Votelikelihood", choices = c("*"="*"), multiple = TRUE, selected="*",
+      pickerInput("q3", "Q3_Votelikelihood",
+                  choices = c("*"="*", "definite", "probable", "unlikely", "no"),
+                  selected = "*", multiple = TRUE,
                   options = list(`actions-box`=TRUE, `live-search`=TRUE)),
-      pickerInput("q4", "Q4_Issue", choices = c("*"="*"), multiple = TRUE, selected="*",
+      pickerInput("q4", "Q4_Issue",
+                  choices = c("*"="*", "Economy", "Immigration", "Housing", "Net zero", "NHS"),
+                  selected = "*", multiple = TRUE,
                   options = list(`actions-box`=TRUE, `live-search`=TRUE)),
       hr(),
       actionButton("run_query", "Retrieve data", class = "btn-primary"),
@@ -121,16 +129,19 @@ ui <- fluidPage(
                   choices = c("(load data first)"=""), multiple = FALSE),
       pickerInput("analysis_support_levels", "Supportive Q2 levels",
                   choices = c("pledge", "strong", "lean_to", "none"),
-                  selected = c("pledge", "strong"), multiple = TRUE,
+                  selected = c("pledge","strong","lean_to"), multiple = TRUE,
                   options = list(`actions-box`=TRUE)),
-      pickerInput("analysis_persuadable_levels", "Persuasion levels (Q2)",
-                  choices = c("lean_to"), selected = c("lean_to"),
+      pickerInput("analysis_persuasion_levels_q3", "Persuasion = Q3_Votelikelihood in:",
+                  choices = c("definite","probable","unlikely","no"),
+                  selected = c("probable","unlikely"),
                   multiple = TRUE, options = list(`actions-box`=TRUE)),
       selectInput("analysis_metric", "Metric",
-                  choices = c("Support rate (EB)"="rate_eb",
-                              "Expected supporters (EB)"="expected_supporters",
-                              "Persuasion pool"="persuasion_pool"),
-                  selected = "rate_eb"),
+                  choices = c("Support rate (EB)"                  = "rate_eb",
+                              "Expected supporters (EB, pop‑scaled)" = "expected_supporters",
+                              "Expected supporters (raw, pop‑scaled)"= "expected_supporters_raw",
+                              "Persuasion pool"                     = "persuasion_pool"),
+                  selected = "expected_supporters"  # or "rate_eb" if you prefer
+      ),
       numericInput("analysis_min_n", "Minimum effective sample size per OA", value = 10, min = 0, step = 1),
       numericInput("analysis_half_life", "Recency half-life (days)", value = 30, min = 1, step = 1),
       actionButton("run_analysis", "Run analysis", class = "btn-success")
@@ -144,7 +155,13 @@ ui <- fluidPage(
       h4("Analysis outputs"),
       DTOutput("oa_ranking"),
       plotOutput("plot_top_oas", height = 320),
-      plotOutput("plot_heatmap", height = 320)
+      plotOutput("plot_heatmap", height = 320),
+      plotOutput("plot_response_heatmap", height = 320),
+      tabPanel("Debug",
+               verbatimTextOutput("dbg_counts"),
+               verbatimTextOutput("dbg_cols"),
+               DT::DTOutput("dbg_head")
+      )
     )
   )
 )
@@ -157,10 +174,25 @@ server <- function(input, output, session) {
   location_scope_sql <- reactiveVal(NULL)
   
   base_table <- reactive({
-    if (isTRUE(input$use_training)) "canvass_simulation.responses_t" else "canvass_simulation.responses"
+    if (isTRUE(input$use_training)) "canvass_simulation.responses_q" else "canvass_simulation.response"
+  })
+  
+  ed_lookup_table <- reactive({
+    if (isTRUE(input$use_training)) {
+      "ed_complete_demo"
+    } else {
+      "ed_complete_20250720"
+    }
   })
   
   ed_cols <- reactive({ ed_map[[input$ed_type]] })
+  
+  
+  # Toggle hamburger
+  observeEvent(input$toggle_sidebar, {
+    # Toggle a CSS class on the <body> to hide/show the sidebar and stretch main
+    session$sendCustomMessage("toggleSidebarClass", list())
+  })
   
   # Toggle: training mode
   observeEvent(input$use_training, {
@@ -191,6 +223,7 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
   
   # Populate ED names when not in training mode
+  
   observeEvent(input$ed_type, {
     req(!isTRUE(input$use_training))
     if (input$ed_type == "*") {
@@ -200,7 +233,7 @@ server <- function(input, output, session) {
     cols <- ed_cols()
     sql <- glue_sql("
       SELECT DISTINCT {`cols$name`} AS ed_name, {`cols$code`} AS ed_code
-      FROM ed_complete_20250720
+      FROM {`ed_lookup_table()`}
       WHERE {`cols$name`} IS NOT NULL AND {`cols$code`} IS NOT NULL
       ORDER BY {`cols$name`}
     ", .con = pool)
@@ -225,11 +258,11 @@ server <- function(input, output, session) {
       return()
     }
     sql <- glue_sql("
-      SELECT DISTINCT oa21cd
-      FROM ed_complete_20250720
-      WHERE {`cols$code`} IN ({ed_codes*})
-      ORDER BY oa21cd
-    ", .con = pool)
+  SELECT DISTINCT oa21cd
+  FROM {`ed_lookup_table()`}
+  WHERE {`cols$code`} IN ({ed_codes*})
+  ORDER BY oa21cd
+", .con = pool)
     oa_df <- dbGetQuery(pool, sql)
     updatePickerInput(session, "oa_codes",
                       choices = c("*"="*", setNames(oa_df$oa21cd, oa_df$oa21cd)),
@@ -249,10 +282,10 @@ server <- function(input, output, session) {
         ed_codes <- parse_ed_codes(input$ed_names)
         if (length(ed_codes)) {
           oa_in_eds <- glue_sql("
-            SELECT DISTINCT oa21cd
-            FROM ed_complete_20250720
-            WHERE {`cols$code`} IN ({ed_codes*})
-          ", .con = pool)
+      SELECT DISTINCT oa21cd
+      FROM {`ed_lookup_table()`}
+      WHERE {`cols$code`} IN ({ed_codes*})
+    ", .con = pool)
           clauses <- append(clauses, glue("oa21cd IN ({oa_in_eds})"))
         }
       }
@@ -267,24 +300,33 @@ server <- function(input, output, session) {
     df <- dbGetQuery(pool, sql)
     location_data(df)
     
+    # Auto-update date inputs
     if ("survey_date" %in% names(df) && nrow(df) > 0) {
-      updateDateInput(session, "start_date", value = min(df$survey_date, na.rm = TRUE))
-      updateDateInput(session, "end_date", value = max(df$survey_date, na.rm = TRUE))
+      updateDateInput(session, "start_date", value = suppressWarnings(min(as.Date(df$survey_date), na.rm = TRUE)))
+      updateDateInput(session, "end_date",   value = suppressWarnings(max(as.Date(df$survey_date), na.rm = TRUE)))
     }
     
-    # Update dropdowns from loaded data (guard for column existence)
+    # Update weekday & time-of-day choices based on actual columns present
     if ("weekday" %in% names(df)) {
       updatePickerInput(session, "weekday",
                         choices = c("*"="*", sort(unique(na.omit(df$weekday)))), selected="*")
     }
-    # Factors (iterate over a named vector)
+    time_choices <- NULL
+    if ("timeofDay" %in% names(df))    time_choices <- sort(unique(na.omit(df$timeofDay)))
+    if ("timeofday" %in% names(df))    time_choices <- sort(unique(na.omit(df$timeofday)))
+    if ("time_period" %in% names(df))  time_choices <- sort(unique(na.omit(df$time_period)))
+    if ("timeOfDay" %in% names(df))    time_choices <- sort(unique(na.omit(df$timeOfDay)))
+    if (!is.null(time_choices) && length(time_choices)) {
+      updatePickerInput(session, "tod", choices = c("*"="*", time_choices), selected="*")
+    }
+    
+    # Factors
     factor_map <- c(q1 = "Q1_Party", q2 = "Q2_Support", q3 = "Q3_Votelikelihood", q4 = "Q4_Issue")
     for (id in names(factor_map)) {
       col <- factor_map[[id]]
       vals <- if (col %in% names(df)) sort(unique(na.omit(df[[col]]))) else character(0)
       updatePickerInput(session, id, choices = c("*"="*", vals), selected="*")
     }
-    # Seed analysis party list
     if ("Q1_Party" %in% names(df)) {
       parties <- sort(unique(na.omit(df$Q1_Party)))
       updatePickerInput(session, "analysis_party", choices = parties,
@@ -296,22 +338,64 @@ server <- function(input, output, session) {
                      type = "message", duration = 5)
   })
   
-  # SQL builder
+  # ========== FINAL SQL (schema-aware for weekday/time column) ==========
   final_sql <- eventReactive(input$run_query, {
+    validate(need(!is.null(location_data()), "Load location data first."))
+    
+    # Detect available columns from current base table
+    schema_df <- dbGetQuery(pool, glue("SELECT * FROM {base_table()} LIMIT 0"))
+    cols_present <- names(schema_df)
+    has <- function(x) x %in% cols_present
+    
+    # Column detection
+    weekday_col <- if (has("weekday")) "weekday" else NA_character_
+    time_col <- dplyr::case_when(
+      has("timeofDay")   ~ "timeofDay",
+      has("timeofday")   ~ "timeofday",
+      has("time_period") ~ "time_period",
+      has("timeOfDay")   ~ "timeOfDay",
+      TRUE               ~ NA_character_
+    )
+    
+    # WHERE clauses
     clauses <- list()
-    if (!is.null(location_scope_sql()) && nzchar(location_scope_sql())) {
-      clauses <- append(clauses, sub("^WHERE\\s+", "", location_scope_sql()))
+    loc_where <- location_scope_sql()
+    if (!is.null(loc_where) && nzchar(loc_where)) {
+      clauses <- append(clauses, sub("^WHERE\\s+", "", loc_where))
     }
-    if (!is.null(input$start_date)) clauses <- append(clauses, glue_sql("survey_date >= {input$start_date}", .con=pool))
-    if (!is.null(input$end_date))   clauses <- append(clauses, glue_sql("survey_date <= {input$end_date}", .con=pool))
-    if (!is_all(input$weekday))     clauses <- append(clauses, glue_sql("weekday IN ({input$weekday*})", .con=pool))
-    if (!is_all(input$tod))         clauses <- append(clauses, glue_sql("timeofDay IN ({input$tod*})", .con=pool))
-    if (!is_all(input$q1)) clauses <- append(clauses, glue_sql("Q1_Party IN ({input$q1*})", .con=pool))
-    if (!is_all(input$q2)) clauses <- append(clauses, glue_sql("Q2_Support IN ({input$q2*})", .con=pool))
-    if (!is_all(input$q3)) clauses <- append(clauses, glue_sql("Q3_Votelikelihood IN ({input$q3*})", .con=pool))
-    if (!is_all(input$q4)) clauses <- append(clauses, glue_sql("Q4_Issue IN ({input$q4*})", .con=pool))
-    where_sql <- if (length(clauses)) paste("WHERE", paste(clauses, collapse=" AND ")) else ""
-    glue("SELECT oa21cd, survey_date, weekday, timeofDay, Q1_Party, Q2_Support, Q3_Votelikelihood, Q4_Issue FROM {base_table()} {where_sql}")
+    if (!is.null(input$start_date)) clauses <- append(clauses, glue_sql("survey_date >= {input$start_date}", .con = pool))
+    if (!is.null(input$end_date))   clauses <- append(clauses, glue_sql("survey_date <= {input$end_date}", .con = pool))
+    if (!is_all(input$weekday) && !is.na(weekday_col)) {
+      clauses <- append(clauses, glue_sql(SQL(paste0(weekday_col, " IN ({input$weekday*})")), .con = pool))
+    }
+    if (!is_all(input$tod) && !is.na(time_col)) {
+      clauses <- append(clauses, glue_sql(SQL(paste0(time_col, " IN ({input$tod*})")), .con = pool))
+    }
+    if (!is_all(input$q1) && has("Q1_Party"))           clauses <- append(clauses, glue_sql("Q1_Party IN ({input$q1*})", .con = pool))
+    if (!is_all(input$q2) && has("Q2_Support"))         clauses <- append(clauses, glue_sql("Q2_Support IN ({input$q2*})", .con = pool))
+    if (!is_all(input$q3) && has("Q3_Votelikelihood"))  clauses <- append(clauses, glue_sql("Q3_Votelikelihood IN ({input$q3*})", .con = pool))
+    if (!is_all(input$q4) && has("Q4_Issue"))           clauses <- append(clauses, glue_sql("Q4_Issue IN ({input$q4*})", .con = pool))
+    
+    where_sql <- if (length(clauses)) paste("WHERE", paste(clauses, collapse = " AND ")) else ""
+
+    # Build SELECT field list only with existing columns
+    select_fields <- c("oa21cd", "survey_date")
+    if (!is.na(weekday_col)) select_fields <- c(select_fields, weekday_col)
+    if (!is.na(time_col))    select_fields <- c(select_fields, time_col)
+    if (has("Q1_Party"))           select_fields <- c(select_fields, "Q1_Party")
+    if (has("Q2_Support"))         select_fields <- c(select_fields, "Q2_Support")
+    if (has("Q3_Votelikelihood"))  select_fields <- c(select_fields, "Q3_Votelikelihood")
+    if (has("Q4_Issue"))           select_fields <- c(select_fields, "Q4_Issue")
+    if (has("Response"))           select_fields <- c(select_fields, "Response")
+    
+    # 🔧 The key fix: compute the clause outside glue, no backticks
+    select_clause <- paste(select_fields, collapse = ", ")
+    
+    glue("
+    SELECT {select_clause}
+    FROM {base_table()}
+    {where_sql}
+  ")
   })
   
   output$sql_preview <- renderText({ req(final_sql()); as.character(final_sql()) })
@@ -342,10 +426,25 @@ server <- function(input, output, session) {
     df <- location_data()
     validate(need(!is.null(df) && nrow(df) > 0, "Load location data first."))
     
+    # Apply time filters in-memory, using detected time column if present
+    time_col <- dplyr::case_when(
+      "timeofDay"   %in% names(df) ~ "timeofDay",
+      "timeofday"   %in% names(df) ~ "timeofday",
+      "time_period" %in% names(df) ~ "time_period",
+      "timeOfDay"   %in% names(df) ~ "timeOfDay",
+      TRUE ~ NA_character_
+    )
+    
     if (!is.null(input$start_date)) df <- df %>% filter(as.Date(survey_date) >= as.Date(input$start_date))
     if (!is.null(input$end_date))   df <- df %>% filter(as.Date(survey_date) <= as.Date(input$end_date))
     if (!is_all(input$weekday) && "weekday" %in% names(df)) df <- df %>% filter(weekday %in% input$weekday)
-    if (!is_all(input$tod)     && "timeofDay" %in% names(df)) df <- df %>% filter(timeofDay %in% input$tod)
+    if (!is_all(input$tod)     && !is.na(time_col))         df <- df %>% filter(.data[[time_col]] %in% input$tod)
+    
+    # Factor filters (optional & guarded)
+    if (!is_all(input$q1) && "Q1_Party" %in% names(df))           df <- df %>% filter(Q1_Party %in% input$q1)
+    if (!is_all(input$q2) && "Q2_Support" %in% names(df))         df <- df %>% filter(Q2_Support %in% input$q2)
+    if (!is_all(input$q3) && "Q3_Votelikelihood" %in% names(df))  df <- df %>% filter(Q3_Votelikelihood %in% input$q3)
+    if (!is_all(input$q4) && "Q4_Issue" %in% names(df))           df <- df %>% filter(Q4_Issue %in% input$q4)
     
     df$._w <- recency_weight(df$survey_date, input$analysis_half_life)
     df
@@ -358,58 +457,91 @@ server <- function(input, output, session) {
     list(alpha0 = p0 * k, beta0 = (1 - p0) * k)
   }
   
+
   ranking <- eventReactive(input$run_analysis, {
     df <- analysis_df()
     validate(need(input$analysis_party != "", "Choose a party for analysis."))
     
+    # Flags
+    # success always uses Q2; pers prefers Q3, falls back to Q2 if Q3 missing
     df <- df %>%
       mutate(
-        success = ifelse(Q1_Party == input$analysis_party & Q2_Support %in% input$analysis_support_levels, 1, 0),
-        pers    = ifelse(Q2_Support %in% input$analysis_persuadable_levels, 1, 0)
-      )
-    ##################
-
-    df <- df %>%
-      mutate(
-        success = ifelse(Q1_Party == input$analysis_party &
-                           Q2_Support %in% input$analysis_support_levels, 1, 0),
-        pers = ifelse(Q2_Support %in% input$analysis_persuadable_levels, 1, 0)
+        success = ifelse(
+          Q1_Party == input$analysis_party &
+            Q2_Support %in% input$analysis_support_levels, 1, 0
+        ),
+        # Use Q3 if present; otherwise fall back to Q2 ("lean_to","none")
+        pers = if ("Q3_Votelikelihood" %in% names(df)) {
+          ifelse(Q3_Votelikelihood %in% input$analysis_persuasion_levels_q3, 1, 0)
+        } else {
+          ifelse(Q2_Support %in% c("lean_to","none"), 1, 0)
+        }
       )
     
-    print(table(df$success))
-    print(table(df$pers))
-    
-    ###################
+    # OA-level summaries (time-decayed)
     grp <- df %>%
       group_by(oa21cd) %>%
       summarise(
-        n_eff = sum(._w, na.rm = TRUE),
-        s_eff = sum(._w * success, na.rm = TRUE),
-        pers_eff = sum(._w * pers, na.rm = TRUE),
-        rate_raw = ifelse(n_eff > 0, s_eff / n_eff, NA_real_),
+        n_raw   = n(),                               # NEW: unweighted count
+        n_eff   = sum(._w, na.rm = TRUE),
+        s_eff   = sum(._w * success, na.rm = TRUE),
+        pers_eff= sum(._w * pers,    na.rm = TRUE),
+        rate_raw= ifelse(n_eff > 0, s_eff / n_eff, NA_real_),
         .groups = "drop"
       ) %>%
       filter(n_eff >= input$analysis_min_n)
     
     validate(need(nrow(grp) > 0, "No OAs meet the minimum effective sample size."))
     
-    prior <- compute_eb_prior(grp$s_eff, grp$n_eff)
+    # EB prior & smoothed rate
+    p0 <- if (sum(grp$n_eff) > 0) sum(grp$s_eff) / sum(grp$n_eff) else 0.5
+    v  <- 0.01
+    k  <- max(p0 * (1 - p0) / v - 1, 1)
+    alpha0 <- p0 * k; beta0 <- (1 - p0) * k
+    
     grp <- grp %>%
       mutate(
-        rate_eb = (s_eff + prior$alpha0) / (n_eff + prior$alpha0 + prior$beta0),
-        expected_supporters = rate_eb * n_eff
+        rate_eb = (s_eff + alpha0) / (n_eff + alpha0 + beta0)
       )
     
+    # ---- JOIN POPULATION (ed_complete_20250720.population) ----
+    oa_pops <- dbGetQuery(pool, "SELECT oa21cd, population FROM ed_complete_20250720")
+    # Ensure types & de-dup
+    oa_pops <- dbGetQuery(pool, glue_sql("
+          SELECT oa21cd, population
+          FROM {`ed_lookup_table()`}
+        ", .con = pool))
+    grp <- left_join(grp %>% mutate(oa21cd = as.character(oa21cd)),
+                     oa_pops %>% mutate(oa21cd = as.character(oa21cd)),
+                     by = "oa21cd")
+    
+    # Notify if many missing populations
+    missing_pop <- sum(is.na(grp$population))
+    if (missing_pop > 0) {
+      showNotification(sprintf("Note: %d OA(s) missing population; expected supporters will be NA for those.", missing_pop),
+                       type = "warning", duration = 6)
+    }
+    
+    # ---- EXPECTED SUPPORTERS (population-scaled) ----
+    grp <- grp %>%
+      mutate(
+        expected_supporters_raw = ifelse(!is.na(population), rate_raw * population, NA_real_),
+        expected_supporters_eb  = ifelse(!is.na(population), rate_eb  * population, NA_real_)
+      )
+    
+    # Which metric to rank by
     metric <- switch(input$analysis_metric,
-                     rate_eb = grp$rate_eb,
-                     expected_supporters = grp$expected_supporters,
-                     persuasion_pool = grp$pers_eff)
+                     rate_eb                 = grp$rate_eb,
+                     expected_supporters     = grp$expected_supporters_eb,  # EB pop‑scaled as default
+                     persuasion_pool         = grp$pers_eff,
+                     expected_supporters_raw = grp$expected_supporters_raw)  # optional new choice
     grp$metric <- metric
     
     grp %>%
       arrange(desc(metric)) %>%
       mutate(rank = row_number()) %>%
-      select(rank, oa21cd, n_eff, s_eff, rate_raw, rate_eb, expected_supporters, pers_eff, metric)
+      select(rank, oa21cd, population, n_raw, n_eff, s_eff, rate_raw, rate_eb,
+             expected_supporters_raw, expected_supporters_eb, pers_eff, metric)
   })
   
   output$oa_ranking <- DT::renderDT({
@@ -419,7 +551,8 @@ server <- function(input, output, session) {
       options = list(pageLength = 20, order = list(list(0, "asc"))),
       rownames = FALSE
     ) %>%
-      formatRound(c("n_eff","s_eff","expected_supporters","pers_eff","metric"), digits = 2) %>%
+      formatRound(c("population","n_eff","s_eff","pers_eff",
+                    "expected_supporters_raw","expected_supporters_eb","metric"), digits = 1) %>%
       formatPercentage("rate_raw", 1) %>%
       formatPercentage("rate_eb", 1)
   })
@@ -427,27 +560,36 @@ server <- function(input, output, session) {
   output$plot_top_oas <- renderPlot({
     req(ranking())
     topn <- head(ranking(), 15)
+    ylab <- switch(input$analysis_metric,
+                   rate_eb                  = "Support rate (EB)",
+                   expected_supporters      = "Expected supporters (EB, pop‑scaled)",
+                   expected_supporters_raw  = "Expected supporters (raw, pop‑scaled)",
+                   persuasion_pool          = "Persuasion pool (weighted)")
     ggplot(topn, aes(x = reorder(oa21cd, metric), y = metric)) +
       geom_col() +
       coord_flip() +
-      labs(
-        x = "OA21 code",
-        y = switch(input$analysis_metric,
-                   rate_eb = "Support rate (EB)",
-                   expected_supporters = "Expected supporters (EB)",
-                   persuasion_pool = "Persuasion pool (weighted)"),
-        title = "Top OAs"
-      )
+      labs(x = "OA21 code", y = ylab, title = "Top OAs")
   })
   
+  # Heatmap: Support rate by weekday x time
   output$plot_heatmap <- renderPlot({
     df <- analysis_df()
     req(nrow(df) > 0, input$analysis_party != "")
     
+    time_col <- dplyr::case_when(
+      "timeofDay"   %in% names(df) ~ "timeofDay",
+      "timeofday"   %in% names(df) ~ "timeofday",
+      "time_period" %in% names(df) ~ "time_period",
+      "timeOfDay"   %in% names(df) ~ "timeOfDay",
+      TRUE ~ NA_character_
+    )
+    req(!is.na(time_col))
+    req("weekday" %in% names(df))
+    
     df2 <- df %>%
       mutate(success = ifelse(Q1_Party == input$analysis_party & Q2_Support %in% input$analysis_support_levels, 1, 0)) %>%
-      filter(!is.na(weekday), !is.na(timeofDay)) %>%
-      group_by(weekday, timeofDay) %>%
+      filter(!is.na(weekday), !is.na(.data[[time_col]])) %>%
+      group_by(weekday, .data[[time_col]]) %>%
       summarise(
         n_eff = sum(._w, na.rm = TRUE),
         s_eff = sum(._w * success, na.rm = TRUE),
@@ -460,11 +602,54 @@ server <- function(input, output, session) {
     prior <- compute_eb_prior(df2$s_eff, df2$n_eff)
     df2 <- df2 %>%
       mutate(rate_eb = (s_eff + prior$alpha0) / (n_eff + prior$alpha0 + prior$beta0))
-
-    ggplot(df2, aes(x = timeofDay, y = weekday, fill = rate_eb)) +
+    
+    ggplot(df2, aes(x = .data[[time_col]], y = weekday, fill = rate_eb)) +
       geom_tile() +
-      scale_fill_gradient(name = "Support rate (EB)", limits = c(0, 1)) +
+      scale_fill_continuous(name = "Support rate (EB)", limits = c(0, 1)) +
       labs(x = "Time of day", y = "Weekday", title = "Best times to canvass (selected party)") +
+      theme_minimal()
+  })
+  
+  # Heatmap: Response rate by weekday x time (if Response column exists)
+  output$plot_response_heatmap <- renderPlot({
+    df <- analysis_df()
+    req(nrow(df) > 0)
+    
+    if (!("Response" %in% names(df))) return(NULL)
+    
+    time_col <- dplyr::case_when(
+      "timeofDay"   %in% names(df) ~ "timeofDay",
+      "timeofday"   %in% names(df) ~ "timeofday",
+      "time_period" %in% names(df) ~ "time_period",
+      "timeOfDay"   %in% names(df) ~ "timeOfDay",
+      TRUE ~ NA_character_
+    )
+    req(!is.na(time_col))
+    req("weekday" %in% names(df))
+    
+    # Coerce Response to 0/1
+    if (!is.numeric(df$Response)) {
+      df <- df %>%
+        mutate(Response = ifelse(tolower(as.character(Response)) %in% c("1","yes","y","responded","true","t"), 1, 0))
+    }
+    
+    df2 <- df %>%
+      filter(!is.na(weekday), !is.na(.data[[time_col]])) %>%
+      group_by(weekday, .data[[time_col]] ) %>%
+      summarise(
+        n_total = n(),
+        n_response = sum(Response, na.rm = TRUE),
+        rate_response = ifelse(n_total > 0, n_response / n_total, NA_real_),
+        .groups = "drop"
+      ) %>%
+      filter(n_total > 0, !is.na(rate_response))
+    
+    if (nrow(df2) == 0) return(NULL)
+    
+    ggplot(df2, aes(x = .data[[time_col]], y = weekday, fill = rate_response)) +
+      geom_tile() +
+      scale_fill_continuous(name = "Response rate", limits = c(0, 1)) +
+      labs(x = "Time of day", y = "Weekday", title = "Response rate by time period") +
       theme_minimal()
   })
 }
